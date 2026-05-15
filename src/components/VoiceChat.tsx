@@ -43,7 +43,8 @@ export default function VoiceChat({
   const [isCompleted, setIsCompleted] = useState(false);
 
   const recognitionRef = useRef<any>(null);
-  const synthRef = useRef<SpeechSynthesis | null>(null);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const audioUrlRef = useRef<string | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const timerRef = useRef<NodeJS.Timeout | null>(null);
   const messagesRef = useRef<Message[]>([]);
@@ -70,11 +71,17 @@ export default function VoiceChat({
     };
   }, [isStarted]);
 
-  // Initialize speech
+  // Clean up audio on unmount
   useEffect(() => {
-    if (typeof window !== "undefined") {
-      synthRef.current = window.speechSynthesis;
-    }
+    return () => {
+      if (audioRef.current) {
+        audioRef.current.pause();
+        audioRef.current.src = "";
+      }
+      if (audioUrlRef.current) {
+        URL.revokeObjectURL(audioUrlRef.current);
+      }
+    };
   }, []);
 
   const formatTime = (seconds: number) => {
@@ -83,49 +90,79 @@ export default function VoiceChat({
     return `${m}:${s.toString().padStart(2, "0")}`;
   };
 
-  const skipSpeech = useCallback(() => {
-    if (synthRef.current) {
-      synthRef.current.cancel();
+  const stopAudio = useCallback(() => {
+    if (audioRef.current) {
+      audioRef.current.pause();
+      audioRef.current.src = "";
+      audioRef.current = null;
+    }
+    if (audioUrlRef.current) {
+      URL.revokeObjectURL(audioUrlRef.current);
+      audioUrlRef.current = null;
     }
     setIsSpeaking(false);
   }, []);
 
+  const skipSpeech = useCallback(() => {
+    stopAudio();
+  }, [stopAudio]);
+
   const speak = useCallback(
-    (text: string): Promise<void> => {
-      return new Promise((resolve) => {
-        if (!synthRef.current) {
-          resolve();
+    async (text: string): Promise<void> => {
+      // Strip any internal markers before sending to TTS
+      const clean = text.replace(/\[ASSESSMENT_COMPLETE\]/g, "").trim();
+      if (!clean) return;
+
+      // Stop any in-flight audio
+      stopAudio();
+
+      try {
+        setIsSpeaking(true);
+        const res = await fetch("/api/tts", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ text: clean }),
+        });
+
+        if (!res.ok || !res.body) {
+          console.error("[VoiceChat] TTS request failed:", res.status);
+          setIsSpeaking(false);
           return;
         }
-        synthRef.current.cancel();
-        setIsSpeaking(true);
 
-        const utterance = new SpeechSynthesisUtterance(text);
-        utterance.rate = 1.0;
-        utterance.pitch = 1.0;
+        const blob = await res.blob();
+        const url = URL.createObjectURL(blob);
+        audioUrlRef.current = url;
 
-        const voices = synthRef.current.getVoices();
-        const preferred = voices.find(
-          (v) =>
-            v.name.includes("Samantha") ||
-            v.name.includes("Karen") ||
-            v.name.includes("Google US English") ||
-            (v.lang === "en-US" && v.localService)
-        );
-        if (preferred) utterance.voice = preferred;
+        const audio = new Audio(url);
+        audioRef.current = audio;
 
-        utterance.onend = () => {
-          setIsSpeaking(false);
-          resolve();
-        };
-        utterance.onerror = () => {
-          setIsSpeaking(false);
-          resolve();
-        };
-        synthRef.current.speak(utterance);
-      });
+        await new Promise<void>((resolve) => {
+          audio.onended = () => {
+            setIsSpeaking(false);
+            if (audioUrlRef.current === url) {
+              URL.revokeObjectURL(url);
+              audioUrlRef.current = null;
+            }
+            resolve();
+          };
+          audio.onerror = () => {
+            console.error("[VoiceChat] Audio playback error");
+            setIsSpeaking(false);
+            resolve();
+          };
+          audio.play().catch((err) => {
+            console.error("[VoiceChat] Audio play() failed:", err);
+            setIsSpeaking(false);
+            resolve();
+          });
+        });
+      } catch (err) {
+        console.error("[VoiceChat] speak() error:", err);
+        setIsSpeaking(false);
+      }
     },
-    []
+    [stopAudio]
   );
 
   const handleAIResponse = useCallback(
@@ -163,8 +200,7 @@ export default function VoiceChat({
       if (isClosing) {
         // Immediately show the completion screen — no more chat interaction
         setIsCompleted(true);
-        if (synthRef.current) synthRef.current.cancel();
-        setIsSpeaking(false);
+        stopAudio();
         setShowQuickReplies(false);
 
         // Build the full transcript (include the AI's final message)
@@ -229,7 +265,7 @@ export default function VoiceChat({
       }
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [speak, onComplete, candidatePageId, candidateName, candidateEmail]
+    [speak, onComplete, candidatePageId, candidateName, candidateEmail, stopAudio]
   );
 
   const sendToAI = useCallback(
@@ -246,8 +282,7 @@ export default function VoiceChat({
         if (data.isScoring) {
           // Show completion screen immediately
           setIsCompleted(true);
-          if (synthRef.current) synthRef.current.cancel();
-          setIsSpeaking(false);
+          stopAudio();
           setShowQuickReplies(false);
 
           await fetch("/api/submit-results", {
@@ -274,7 +309,7 @@ export default function VoiceChat({
         setIsProcessing(false);
       }
     },
-    [candidateName, candidateEmail, candidatePageId]
+    [candidateName, candidateEmail, candidatePageId, stopAudio, onComplete]
   );
 
   // Send a text message (used by quick replies and typed input)
